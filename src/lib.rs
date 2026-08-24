@@ -33,13 +33,14 @@ use serde::{Deserialize, Serialize};
 ///
 /// `Contact`/`Company`/`Stats` are associated types, not fixed structs —
 /// each backend defines its own shape. This crate only needs them to be
-/// `Serialize` (to return as tool output) and `JsonSchema` (so `rmcp` can
-/// generate a tool output schema); it never inspects their fields itself.
+/// `Serialize` (to return as tool output); it never inspects their fields
+/// itself. Only tool *inputs* (defined by this crate, not the backend) need
+/// a JSON schema — tool outputs are just serialized directly.
 #[async_trait]
 pub trait McpBackend: Send + Sync + 'static {
-    type Contact: Serialize + schemars::JsonSchema + Send + Sync;
-    type Company: Serialize + schemars::JsonSchema + Send + Sync;
-    type Stats: Serialize + schemars::JsonSchema + Send + Sync;
+    type Contact: Serialize + Send + Sync;
+    type Company: Serialize + Send + Sync;
+    type Stats: Serialize + Send + Sync;
     type Error: std::fmt::Display + Send + Sync;
 
     /// Free-text search across whatever fields the backend considers
@@ -155,7 +156,7 @@ struct SearchContactsParams {
     offset: Option<i64>,
 }
 
-#[derive(Debug, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Serialize)]
 struct SearchContactsResult<C> {
     total_matches: i64,
     results: Vec<C>,
@@ -167,7 +168,7 @@ struct CompanyNetworkParams {
     name: String,
 }
 
-#[derive(Debug, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Serialize)]
 struct CompanyNetworkResult<Co, Ct> {
     found: bool,
     company: Option<Co>,
