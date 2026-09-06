@@ -1,6 +1,6 @@
 [package]
 name = "vault-mcp-core"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.77"
 description = "A generic, reusable MCP (Model Context Protocol) server shell for local-first personal-data apps. Bring your own backend (a contacts/company store, or anything else shaped like one) by implementing McpBackend."

@@ -3,7 +3,7 @@
 //! shaped roughly like one.
 //!
 //! This crate has zero knowledge of any particular app's schema or storage.
-//! It defines [`McpBackend`], a trait describing the six operations a
+//! It defines [`McpBackend`], a trait describing the eight operations a
 //! contacts-style data source needs to support, and [`McpServer`], a generic
 //! MCP server that exposes those operations as MCP tools over any transport
 //! `rmcp` supports (stdio, HTTP/SSE, …). Bring your own backend by
@@ -25,10 +25,10 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 
-/// The six operations a contacts/company-style backend must implement to be
-/// exposed as MCP tools. Every method takes `&self` (implementers own their
-/// own interior mutability/locking, e.g. an `Arc<Mutex<Connection>>`) and
-/// returns `Result<_, Self::Error>` — errors are surfaced to the calling
+/// The eight operations a contacts/company-style backend must implement to
+/// be exposed as MCP tools. Every method takes `&self` (implementers own
+/// their own interior mutability/locking, e.g. an `Arc<Mutex<Connection>>`)
+/// and returns `Result<_, Self::Error>` — errors are surfaced to the calling
 /// agent as an MCP tool error, via `Self::Error: Display`.
 ///
 /// `Contact`/`Company`/`Stats` are associated types, not fixed structs —
@@ -36,12 +36,24 @@ use serde::{Deserialize, Serialize};
 /// `Serialize` (to return as tool output); it never inspects their fields
 /// itself. Only tool *inputs* (defined by this crate, not the backend) need
 /// a JSON schema — tool outputs are just serialized directly.
+///
+/// `Error: From<&'static str>` (in addition to `Display`) exists so the two
+/// *default-implemented* methods below (`update_company_fields`,
+/// `list_companies_needing_enrichment`) can construct a "not supported by
+/// this backend" error generically, without requiring every implementer to
+/// override them. This is a small additional bound beyond the original
+/// `Display`-only requirement — checked against Vault's own `Error = String`
+/// (satisfied: `String: From<&str>` for any lifetime including `'static`)
+/// and reasonable for any other implementer, since almost every error type
+/// either already has this impl or can derive it trivially (e.g. via
+/// `thiserror`'s `#[error("{0}")]` on a newtype, or a plain `String`/`Box<dyn
+/// Error>` error type).
 #[async_trait]
 pub trait McpBackend: Send + Sync + 'static {
     type Contact: Serialize + Send + Sync;
     type Company: Serialize + Send + Sync;
     type Stats: Serialize + Send + Sync;
-    type Error: std::fmt::Display + Send + Sync;
+    type Error: std::fmt::Display + Send + Sync + From<&'static str>;
 
     /// Free-text search across whatever fields the backend considers
     /// relevant (name, company, title, notes, …). `status` is a
@@ -98,6 +110,37 @@ pub trait McpBackend: Send + Sync + 'static {
     /// does), a real job queue, or anything else. Returns how many were
     /// queued.
     async fn enqueue_enrichment(&self, contact_ids: &[i64]) -> Result<i64, Self::Error>;
+
+    /// Update a subset of a company's enrichment fields — whichever the
+    /// backend supports (Vault's whitelist: url, industry, category,
+    /// size_range, description, hq_location, stock_symbol, main_phone).
+    /// `overwrite`: when false (the default a caller should pass unless they
+    /// mean to correct something), a field with a non-blank existing value is
+    /// left untouched even if a new value is supplied — the backend reports
+    /// which fields were actually written. When true, every supplied
+    /// non-empty field is written regardless of its current value.
+    /// Default implementation returns `Self::Error` — override to support
+    /// this operation; backends that don't are simply not enrichable via MCP.
+    async fn update_company_fields(
+        &self,
+        _company_id: i64,
+        _fields: CompanyFieldUpdates,
+        _overwrite: bool,
+    ) -> Result<CompanyFieldsWriteResult<Self::Company>, Self::Error> {
+        Err("update_company_fields is not supported by this backend".into())
+    }
+
+    /// Companies missing enrichment data (backend-defined "missing" — Vault's
+    /// is a blank `url`), sorted by contact count descending, with obvious
+    /// non-company placeholder names excluded. `limit` capped by the backend
+    /// (Vault: default 50, max 500). Read-only.
+    /// Default implementation returns an empty list — override to support.
+    async fn list_companies_needing_enrichment(
+        &self,
+        _limit: i64,
+    ) -> Result<Vec<Self::Company>, Self::Error> {
+        Ok(vec![])
+    }
 }
 
 fn backend_err<E: std::fmt::Display>(e: E) -> ErrorData {
@@ -198,6 +241,65 @@ struct EnqueueEnrichmentParams {
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 struct EnqueueResult {
     queued: i64,
+}
+
+/// One entry per Vault-whitelisted enrichment field. All optional — supply
+/// only the ones you have a value for.
+#[derive(Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
+pub struct CompanyFieldUpdates {
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub industry: Option<String>,
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub size_range: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub hq_location: Option<String>,
+    #[serde(default)]
+    pub stock_symbol: Option<String>,
+    #[serde(default)]
+    pub main_phone: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+struct UpdateCompanyFieldsParams {
+    company_id: i64,
+    #[serde(default)]
+    fields: CompanyFieldUpdates,
+    /// If true, overwrite fields that already have a value. Default false —
+    /// only fills in currently-blank fields.
+    #[serde(default)]
+    overwrite: bool,
+}
+
+/// Result of `update_company_fields` — reports what actually changed, not
+/// just the resulting record, so an agent (and the user watching the
+/// permission prompt) can see exactly what was written vs. left alone.
+#[derive(Debug, Serialize)]
+pub struct CompanyFieldsWriteResult<Co> {
+    pub company: Co,
+    /// Field names actually written this call.
+    pub fields_written: Vec<&'static str>,
+    /// Field names supplied but skipped because they already had a value
+    /// and `overwrite` was false.
+    pub fields_skipped_already_set: Vec<&'static str>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ListCompaniesNeedingEnrichmentParams {
+    /// Max companies to return. Default 50, capped at 500. Accepts a number
+    /// or a numeric string.
+    #[serde(default, deserialize_with = "deserialize_flexible_i64")]
+    limit: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+struct ListCompaniesNeedingEnrichmentResult<Co> {
+    companies: Vec<Co>,
 }
 
 /// The generic MCP server. Wraps any [`McpBackend`] implementation and
@@ -310,6 +412,44 @@ impl<B: McpBackend> McpServer<B> {
         let queued = self.backend.enqueue_enrichment(&p.contact_ids).await.map_err(backend_err)?;
         json_result(&EnqueueResult { queued })
     }
+
+    #[tool(
+        description = "Update a company's enrichment fields (url, industry, category, \
+                        size_range, description, hq_location, stock_symbol, main_phone) — any \
+                        subset you have values for. By default only fills fields that are \
+                        currently blank; a field that already has a value is left untouched \
+                        unless you pass overwrite: true. The result tells you which fields were \
+                        actually written vs. skipped because they were already set. Use \
+                        get_company_network first if you're not certain of the company_id."
+    )]
+    async fn update_company_fields(
+        &self,
+        Parameters(p): Parameters<UpdateCompanyFieldsParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let result = self
+            .backend
+            .update_company_fields(p.company_id, p.fields, p.overwrite)
+            .await
+            .map_err(backend_err)?;
+        json_result(&result)
+    }
+
+    #[tool(
+        description = "List companies missing enrichment data (blank domain/industry/etc.), \
+                        sorted by contact count descending, with obvious non-company LinkedIn \
+                        export artifacts (\"Self Employed\", \"Freelance\", \"Consultant\", \
+                        \"Stealth ...\", and similar) already excluded. Read-only — use this to \
+                        pick a batch to enrich, then update_company_fields for each one. Default \
+                        50, capped at 500."
+    )]
+    async fn list_companies_needing_enrichment(
+        &self,
+        Parameters(p): Parameters<ListCompaniesNeedingEnrichmentParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let limit = p.limit.unwrap_or(50).clamp(1, 500);
+        let companies = self.backend.list_companies_needing_enrichment(limit).await.map_err(backend_err)?;
+        json_result(&ListCompaniesNeedingEnrichmentResult { companies })
+    }
 }
 
 #[tool_handler]
@@ -330,5 +470,129 @@ impl<B: McpBackend> McpServer<B> {
         let service = self.serve(stdio()).await?;
         service.waiting().await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug, Clone, Serialize)]
+    struct FakeContact {
+        id: i64,
+    }
+    #[derive(Debug, Clone, Serialize)]
+    struct FakeCompany {
+        id: i64,
+        name: String,
+    }
+    #[derive(Debug, Clone, Serialize)]
+    struct FakeStats {
+        total: i64,
+    }
+
+    /// Implements every ORIGINAL required `McpBackend` method but
+    /// deliberately does NOT override `update_company_fields` or
+    /// `list_companies_needing_enrichment` — this is the actual proof that
+    /// adding those two methods (both default-implemented) did not break an
+    /// existing implementer, which is the whole point of making them
+    /// default-implemented rather than required.
+    struct MinimalBackend;
+
+    #[async_trait]
+    impl McpBackend for MinimalBackend {
+        type Contact = FakeContact;
+        type Company = FakeCompany;
+        type Stats = FakeStats;
+        type Error = String;
+
+        async fn search_contacts(
+            &self,
+            _query: &str,
+            _status: &str,
+            _limit: i64,
+            _offset: i64,
+        ) -> Result<(i64, Vec<Self::Contact>), Self::Error> {
+            Ok((0, vec![]))
+        }
+
+        async fn stats(&self) -> Result<Self::Stats, Self::Error> {
+            Ok(FakeStats { total: 0 })
+        }
+
+        async fn company_network(
+            &self,
+            _name: &str,
+        ) -> Result<(bool, Option<Self::Company>, Vec<Self::Contact>), Self::Error> {
+            Ok((false, None, vec![]))
+        }
+
+        async fn update_contact_field(
+            &self,
+            _contact_id: i64,
+            _field: &str,
+            _value: &str,
+        ) -> Result<Self::Contact, Self::Error> {
+            Ok(FakeContact { id: 1 })
+        }
+
+        async fn merge_company_alias(&self, _company_id: i64, _new_name: &str) -> Result<Self::Company, Self::Error> {
+            Ok(FakeCompany { id: 1, name: "x".to_string() })
+        }
+
+        async fn enqueue_enrichment(&self, contact_ids: &[i64]) -> Result<i64, Self::Error> {
+            Ok(contact_ids.len() as i64)
+        }
+
+        // `update_company_fields` / `list_companies_needing_enrichment`:
+        // intentionally NOT overridden — see `MinimalBackend`'s doc comment.
+    }
+
+    #[tokio::test]
+    async fn default_update_company_fields_returns_a_clear_not_supported_error() {
+        let backend = MinimalBackend;
+        let err = backend
+            .update_company_fields(1, CompanyFieldUpdates::default(), false)
+            .await
+            .expect_err("a backend that doesn't override this must reject it, not silently succeed");
+        assert!(err.contains("not supported"), "error should say the operation isn't supported: {err}");
+    }
+
+    #[tokio::test]
+    async fn default_list_companies_needing_enrichment_returns_an_empty_list() {
+        let backend = MinimalBackend;
+        let companies = backend
+            .list_companies_needing_enrichment(50)
+            .await
+            .expect("the default must be Ok(empty), not an error — this one has no error path");
+        assert!(companies.is_empty());
+    }
+
+    /// Compiles a real `McpServer<MinimalBackend>` and calls both new tools
+    /// through the exact same generated methods the `tools/call` JSON-RPC
+    /// dispatcher uses — proof the non-breaking default plumbs all the way
+    /// through the tool layer, not just the trait method in isolation.
+    #[tokio::test]
+    async fn server_over_a_non_overriding_backend_still_answers_both_new_tools() {
+        let server = McpServer::new(MinimalBackend, "test-server", "test instructions");
+
+        let update_result = server
+            .update_company_fields(Parameters(UpdateCompanyFieldsParams {
+                company_id: 1,
+                fields: CompanyFieldUpdates::default(),
+                overwrite: false,
+            }))
+            .await;
+        assert!(update_result.is_err(), "tool call should surface the backend's not-supported error");
+
+        let list_result = server
+            .list_companies_needing_enrichment(Parameters(ListCompaniesNeedingEnrichmentParams { limit: None }))
+            .await
+            .expect("list tool should succeed with an empty list, not error");
+        let ContentBlock::Text(text) = &list_result.content[0] else {
+            panic!("expected a text content block, got {:?}", list_result.content[0]);
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&text.text).unwrap();
+        assert_eq!(parsed, serde_json::json!({ "companies": [] }));
     }
 }
