@@ -2,13 +2,13 @@
 
 A generic, reusable [MCP](https://modelcontextprotocol.io) (Model Context Protocol) server shell for local-first personal-data apps — contacts/company CRMs, or anything else shaped roughly like one.
 
-This crate has zero knowledge of any particular app's schema or storage. It defines `McpBackend`, a trait describing six operations a contacts-style data source needs to support, and `McpServer`, a generic MCP server that exposes those operations as MCP tools over any transport [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk) supports (stdio, HTTP/SSE, …).
+This crate has zero knowledge of any particular app's schema or storage. It defines `McpBackend`, a trait describing eight operations a contacts-style data source needs to support, and `McpServer`, a generic MCP server that exposes those operations as MCP tools over any transport [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk) supports (stdio, HTTP/SSE, …).
 
 Bring your own backend by implementing `McpBackend` against your own data. This crate handles the MCP protocol plumbing, tool schemas, and tool descriptions.
 
 This is the extracted, generic core of [Proactive Vault](https://www.proactivepotential.com/vault)'s own MCP integration — Vault's app implements `McpBackend` against its real SQLite-backed contacts/company store and depends on this crate directly.
 
-## The six tools
+## The eight tools
 
 - `search_contacts` — free-text search with pagination
 - `get_stats` — aggregate counts
@@ -16,6 +16,15 @@ This is the extracted, generic core of [Proactive Vault](https://www.proactivepo
 - `update_contact_field` — edit one field on a contact
 - `merge_company_alias` — rename or merge a company
 - `enqueue_enrichment` — flag contacts for manual follow-up
+- `update_company_fields` — write a subset of a company's enrichment fields
+  (url, industry, category, size_range, description, hq_location,
+  stock_symbol, main_phone); by default only fills currently-blank fields,
+  with an `overwrite: true` opt-out. Backends that don't override this
+  (default trait impl) reject it as unsupported.
+- `list_companies_needing_enrichment` — read-only list of companies missing
+  enrichment data, backend-defined "missing" and sort order (Vault: blank
+  `url`, sorted by contact count descending). Backends that don't override
+  this (default trait impl) return an empty list.
 
 ## Usage
 
@@ -29,11 +38,13 @@ impl McpBackend for MyBackend {
     type Contact = MyContact;   // your own type, just needs Serialize + JsonSchema
     type Company = MyCompany;
     type Stats = MyStats;
-    type Error = MyError;       // needs Display
+    type Error = MyError;       // needs Display + From<&'static str>
 
     async fn search_contacts(&self, query: &str, status: &str, limit: i64, offset: i64)
         -> Result<(i64, Vec<Self::Contact>), Self::Error> { /* ... */ }
-    // ...the other five methods
+    // ...the other five required methods (update_company_fields and
+    // list_companies_needing_enrichment are optional — they default to
+    // "not supported" / an empty list if you don't override them)
 }
 
 #[tokio::main]
