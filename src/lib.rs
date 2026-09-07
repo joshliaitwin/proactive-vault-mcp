@@ -247,12 +247,23 @@ struct EnqueueResult {
 /// only the ones you have a value for.
 #[derive(Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct CompanyFieldUpdates {
+    /// Official website, e.g. "https://www.acme.com".
     #[serde(default)]
     pub url: Option<String>,
+    /// Free-text business sector, e.g. "Banking & Financial Services".
     #[serde(default)]
     pub industry: Option<String>,
+    /// The kind of organisation. EXACTLY ONE of: "Public Company",
+    /// "Private Company", "Academic Institution", "Non-Profit",
+    /// "Government Entity", "Partnership", "Subsidiary". Rules of thumb:
+    /// has a stock ticker → Public Company; .edu domain or a
+    /// university/college/school → Academic Institution; .gov/.mil → Government
+    /// Entity; .org → Non-Profit; a law firm / LLP / PwC / Deloitte / EY / KPMG
+    /// → Partnership; plainly owned by another company → Subsidiary; otherwise
+    /// → Private Company.
     #[serde(default)]
     pub category: Option<String>,
+    /// Employee count as a single number, e.g. "74000".
     #[serde(default)]
     pub size_range: Option<String>,
     #[serde(default)]
@@ -416,10 +427,16 @@ impl<B: McpBackend> McpServer<B> {
     #[tool(
         description = "Update a company's enrichment fields (url, industry, category, \
                         size_range, description, hq_location, stock_symbol, main_phone) — any \
-                        subset you have values for. By default only fills fields that are \
-                        currently blank; a field that already has a value is left untouched \
-                        unless you pass overwrite: true. The result tells you which fields were \
-                        actually written vs. skipped because they were already set. Use \
+                        subset you have values for. `category` must be EXACTLY ONE of: \
+                        \"Public Company\", \"Private Company\", \"Academic Institution\", \
+                        \"Non-Profit\", \"Government Entity\", \"Partnership\", \"Subsidiary\" \
+                        (has a ticker → Public Company; .edu / a school → Academic Institution; \
+                        .gov/.mil → Government Entity; .org → Non-Profit; law firm / LLP / Big \
+                        Four → Partnership; owned by another company → Subsidiary; else → \
+                        Private Company). By default only fills fields that are currently \
+                        blank; a field that already has a value is left untouched unless you \
+                        pass overwrite: true. The result tells you which fields were actually \
+                        written vs. skipped because they were already set. Use \
                         get_company_network first if you're not certain of the company_id."
     )]
     async fn update_company_fields(
