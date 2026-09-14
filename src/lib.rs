@@ -141,6 +141,52 @@ pub trait McpBackend: Send + Sync + 'static {
     ) -> Result<Vec<Self::Company>, Self::Error> {
         Ok(vec![])
     }
+
+    /// Update a subset of a contact's enrichment fields — whichever the
+    /// backend supports (Vault's whitelist: schools_attended,
+    /// previous_companies, geographic_location, ai_research_summary).
+    /// `write_mode` is backend-defined; Vault accepts "overwrite" (replace
+    /// unconditionally), "skip" (the default — leave a field alone if it
+    /// already has a value), or "append" (add the new value after the
+    /// existing one, with a date stamp, rather than replacing it).
+    /// `ai_research_summary` is a system-authored synthesis, not a place a
+    /// user hand-types notes, so a backend may choose to always overwrite it
+    /// regardless of `write_mode` — see the backend's own docs.
+    /// Default implementation returns `Self::Error` — override to support
+    /// this operation; backends that don't are simply not enrichable via MCP.
+    async fn update_contact_fields(
+        &self,
+        _contact_id: i64,
+        _fields: ContactFieldUpdates,
+        _write_mode: &str,
+    ) -> Result<ContactFieldsWriteResult<Self::Contact>, Self::Error> {
+        Err("update_contact_fields is not supported by this backend".into())
+    }
+
+    /// Contacts missing enrichment data (backend-defined "missing"). `limit`
+    /// capped by the backend (Vault: default 50, max 200). Read-only.
+    /// Default implementation returns an empty list — override to support.
+    async fn list_contacts_needing_enrichment(
+        &self,
+        _limit: i64,
+    ) -> Result<Vec<Self::Contact>, Self::Error> {
+        Ok(vec![])
+    }
+
+    /// Exports a full, still-encrypted snapshot of the ENTIRE data source
+    /// (every record, every field — not just what the enrichment tools
+    /// touch) to `path`, a destination the caller chooses. This is a
+    /// whole-database backup, meant to be safe to call unattended on a
+    /// schedule: it must never modify the live data, only read from it. The
+    /// resulting file's exact requirements for being opened again (does it
+    /// need the same encryption key, the same app, …) are entirely
+    /// backend-defined — this crate has no opinion on storage format.
+    /// Default implementation returns `Self::Error` — override to support
+    /// this; a backend with no on-disk database concept, or that doesn't
+    /// want to expose this over MCP, simply doesn't implement it.
+    async fn backup_vault(&self, _path: &str) -> Result<(), Self::Error> {
+        Err("backup_vault is not supported by this backend".into())
+    }
 }
 
 fn backend_err<E: std::fmt::Display>(e: E) -> ErrorData {
@@ -313,6 +359,133 @@ struct ListCompaniesNeedingEnrichmentResult<Co> {
     companies: Vec<Co>,
 }
 
+/// One entry per Vault-whitelisted contact enrichment field. All optional —
+/// supply only the ones you have a value for. `deny_unknown_fields`
+/// deliberately rejects, rather than silently drops, a field that belongs
+/// elsewhere (e.g. "email", which is core-column data set via the separate
+/// `update_contact_field` tool, not a member of this struct) — an agent that
+/// puts it here by mistake gets a loud, actionable schema error instead of a
+/// tool call that reports success while quietly writing nothing for that
+/// field (confirmed live, 2026-09-12: an agent claimed it injected a primary
+/// email this way and the value never reached the vault).
+#[derive(Debug, Default, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ContactFieldUpdates {
+    /// Free text, as found (e.g. "Harvard University (MBA); UC Berkeley (BS)").
+    #[serde(default)]
+    pub schools_attended: Option<String>,
+    /// Free-text list of past employers — from the profile's Experience
+    /// section (check it explicitly; don't rely on About text alone). If
+    /// there's no Experience section at all, fall back to whatever role/
+    /// company info is stated in the About text instead.
+    #[serde(default)]
+    pub previous_companies: Option<String>,
+    /// Free-text list of past job titles, paired with previous_companies —
+    /// from the same Experience section (e.g. "VP Engineering at Acme;
+    /// Senior Engineer at Beta Corp").
+    #[serde(default)]
+    pub previous_positions: Option<String>,
+    /// City, state, country if available; else region/country; else country
+    /// only. Never more precise than city-level.
+    #[serde(default)]
+    pub geographic_location: Option<String>,
+    /// A fresh 2-4 sentence synthesis (LinkedIn "About" + recent activity, or
+    /// a general web search). Rewritten each enrichment run, not appended to.
+    #[serde(default)]
+    pub ai_research_summary: Option<String>,
+    /// Mobile phone number, as found (e.g. from LinkedIn's "Contact info"
+    /// overlay — NOT the public profile page, which never shows it). Use
+    /// this specifically for a number LinkedIn itself labels "Mobile" —
+    /// "Home"/"Work" go in home_phone/business_phone instead. LinkedIn lets
+    /// someone list more than one phone of the SAME type; if so, join them
+    /// (e.g. "6825835401; 2145550100").
+    #[serde(default)]
+    pub mobile_phone: Option<String>,
+    /// A phone number LinkedIn itself labels "Home".
+    #[serde(default)]
+    pub home_phone: Option<String>,
+    /// A phone number LinkedIn itself labels "Work".
+    #[serde(default)]
+    pub business_phone: Option<String>,
+    /// Street address, as found (LinkedIn "Contact info" overlay only).
+    #[serde(default)]
+    pub home_address: Option<String>,
+    /// Website(s) from the "Contact info" overlay, each with its LinkedIn
+    /// type. Format as "Type: url" per entry, joined with "; " if there's
+    /// more than one (e.g. "Company: https://roxe.io; Personal: https://joshli.com").
+    #[serde(default)]
+    pub websites: Option<String>,
+    /// Instant-messaging handle(s) from the "Contact info" overlay. Format
+    /// as "Service: username" per entry, joined with "; " if there's more
+    /// than one (e.g. "Skype: jdoe123; WeChat: jdoe_wc").
+    #[serde(default)]
+    pub instant_message: Option<String>,
+    /// Birthday, as found (e.g. "November 22" from LinkedIn's "Contact info"
+    /// overlay). A backend may ignore `write_mode: "append"` for this field
+    /// (a date has no sensible "append" form) and treat it as "overwrite".
+    #[serde(default)]
+    pub birthday: Option<String>,
+    /// A personal/secondary email discovered during research (e.g. from
+    /// LinkedIn's "Contact info" overlay), DISTINCT from the contact's
+    /// primary `email`. A backend may add this to a list rather than
+    /// replacing it outright, regardless of `write_mode` — see its own docs.
+    #[serde(default)]
+    pub secondary_email: Option<String>,
+}
+
+/// `deny_unknown_fields` here too — a field like "email" put at the top
+/// level (a sibling of `fields`, rather than nested inside it) should also
+/// error loudly rather than being silently dropped. See `ContactFieldUpdates`'s
+/// own doc comment for why this matters.
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct UpdateContactFieldsParams {
+    contact_id: i64,
+    #[serde(default)]
+    fields: ContactFieldUpdates,
+    /// How to handle a field that already has a value: "overwrite" (replace
+    /// it), "skip" (leave it alone — the default), or "append" (add the new
+    /// value after the existing one with a date stamp). Backend-defined
+    /// beyond these three conventional values.
+    #[serde(default)]
+    write_mode: Option<String>,
+}
+
+/// Result of `update_contact_fields` — reports what actually changed, not
+/// just the resulting record.
+#[derive(Debug, Serialize)]
+pub struct ContactFieldsWriteResult<Ct> {
+    pub contact: Ct,
+    /// Field names actually written this call.
+    pub fields_written: Vec<&'static str>,
+    /// Field names supplied but skipped because they already had a value and
+    /// `write_mode` was "skip" (or omitted).
+    pub fields_skipped_already_set: Vec<&'static str>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ListContactsNeedingEnrichmentParams {
+    /// Max contacts to return. Default 50, capped at 200. Accepts a number or
+    /// a numeric string.
+    #[serde(default, deserialize_with = "deserialize_flexible_i64")]
+    limit: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+struct ListContactsNeedingEnrichmentResult<Ct> {
+    contacts: Vec<Ct>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct BackupVaultParams {
+    /// Absolute destination file path for the backup, e.g.
+    /// "/Users/jane/Library/Mobile Documents/com~apple~CloudDocs/vault-backup-2026-09-14-0600.db".
+    /// The parent directory must already exist — this does not create
+    /// folders. If a file already exists at this exact path, it's
+    /// overwritten.
+    path: String,
+}
+
 /// The generic MCP server. Wraps any [`McpBackend`] implementation and
 /// exposes its six operations as MCP tools. Construct one with
 /// [`McpServer::new`], then hand it to whichever `rmcp` transport you want
@@ -467,6 +640,78 @@ impl<B: McpBackend> McpServer<B> {
         let companies = self.backend.list_companies_needing_enrichment(limit).await.map_err(backend_err)?;
         json_result(&ListCompaniesNeedingEnrichmentResult { companies })
     }
+
+    #[tool(
+        description = "Update a contact's enrichment fields — any subset you have values for: \
+                        schools_attended, previous_companies, previous_positions, \
+                        geographic_location, ai_research_summary, mobile_phone, home_phone, \
+                        business_phone, home_address, websites, instant_message, birthday, \
+                        secondary_email. previous_companies/previous_positions come from the \
+                        profile's Experience section specifically (check it explicitly) — fall back \
+                        to the About text only when there's no Experience section at all. \
+                        geographic_location should never be more precise than city-level (city, \
+                        state, country if available; else region/country; else country only — no \
+                        street address; a full street address, if you have one, is home_address \
+                        instead). ai_research_summary is a fresh 2-4 sentence synthesis, rewritten \
+                        each run, not appended to. mobile_phone/home_phone/business_phone/ \
+                        home_address/websites/instant_message/birthday are typically only visible \
+                        on LinkedIn's \"Contact info\" overlay, not the public profile page — match \
+                        each phone to the type LinkedIn itself labels it (Mobile/Home/Work); for \
+                        websites and instant_message, format each entry as \"Type: value\" and join \
+                        multiple with \"; \". secondary_email is a personal/alternate email distinct \
+                        from the contact's primary email — it's added to a list rather than \
+                        replacing anything, regardless of write_mode. write_mode controls what \
+                        happens to a field that already has a value: \"skip\" (default — leave it \
+                        alone), \"overwrite\" (replace it), or \"append\" (add the new value after \
+                        the old one with a date stamp; for birthday, treated as \"overwrite\" since \
+                        a date has no sensible append form). The result tells you which fields were \
+                        actually written vs. skipped. Use search_contacts first if you're not \
+                        certain of the contact_id."
+    )]
+    async fn update_contact_fields(
+        &self,
+        Parameters(p): Parameters<UpdateContactFieldsParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let write_mode = p.write_mode.as_deref().unwrap_or("skip");
+        let result = self
+            .backend
+            .update_contact_fields(p.contact_id, p.fields, write_mode)
+            .await
+            .map_err(backend_err)?;
+        json_result(&result)
+    }
+
+    #[tool(
+        description = "List contacts missing enrichment data (schools_attended, previous_companies, \
+                        geographic_location, or ai_research_summary all blank). Read-only — use this \
+                        to pick a batch to enrich, then update_contact_fields for each one. Default \
+                        50, capped at 200."
+    )]
+    async fn list_contacts_needing_enrichment(
+        &self,
+        Parameters(p): Parameters<ListContactsNeedingEnrichmentParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let limit = p.limit.unwrap_or(50).clamp(1, 200);
+        let contacts = self.backend.list_contacts_needing_enrichment(limit).await.map_err(backend_err)?;
+        json_result(&ListContactsNeedingEnrichmentResult { contacts })
+    }
+
+    #[tool(
+        description = "Export a full, still-encrypted backup of the ENTIRE vault (every contact, \
+                        company, and custom field — not a per-record write) to `path`. The parent \
+                        directory must already exist. Safe to call on an unattended schedule: this \
+                        only reads a snapshot of the live data, it never modifies anything. The \
+                        resulting file typically only opens again on the same machine/install it \
+                        was made on — check the backend's own instructions or documentation before \
+                        assuming a backup can be moved elsewhere and restored."
+    )]
+    async fn backup_vault(
+        &self,
+        Parameters(p): Parameters<BackupVaultParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.backend.backup_vault(&p.path).await.map_err(backend_err)?;
+        json_result(&serde_json::json!({ "backed_up_to": p.path }))
+    }
 }
 
 #[tool_handler]
@@ -493,6 +738,29 @@ impl<B: McpBackend> McpServer<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression test for the 2026-09-12 silent-drop incident: an agent put
+    /// "email" inside update_contact_fields' `fields` object (it belongs to
+    /// the separate update_contact_field tool) and the call reported success
+    /// while the value never reached the backend at all. `deny_unknown_fields`
+    /// must turn that into a loud deserialization error instead.
+    #[test]
+    fn email_inside_fields_object_is_rejected_not_silently_dropped() {
+        let raw = r#"{"contact_id": 1, "fields": {"email": "x@example.com"}}"#;
+        let err = serde_json::from_str::<UpdateContactFieldsParams>(raw)
+            .expect_err("an unknown field inside `fields` must error, not silently ignore the value");
+        assert!(err.to_string().contains("email"), "error should name the offending field: {err}");
+    }
+
+    /// Same protection at the top level — "email" as a sibling of `fields`
+    /// rather than nested inside it.
+    #[test]
+    fn email_at_top_level_is_also_rejected() {
+        let raw = r#"{"contact_id": 1, "email": "x@example.com"}"#;
+        let err = serde_json::from_str::<UpdateContactFieldsParams>(raw)
+            .expect_err("an unknown top-level field must error, not silently ignore the value");
+        assert!(err.to_string().contains("email"), "error should name the offending field: {err}");
+    }
 
     #[derive(Debug, Clone, Serialize)]
     struct FakeContact {
@@ -561,8 +829,53 @@ mod tests {
             Ok(contact_ids.len() as i64)
         }
 
-        // `update_company_fields` / `list_companies_needing_enrichment`:
+        // `update_company_fields` / `list_companies_needing_enrichment` /
+        // `update_contact_fields` / `list_contacts_needing_enrichment`:
         // intentionally NOT overridden — see `MinimalBackend`'s doc comment.
+    }
+
+    #[tokio::test]
+    async fn default_update_contact_fields_returns_a_clear_not_supported_error() {
+        let backend = MinimalBackend;
+        let err = backend
+            .update_contact_fields(1, ContactFieldUpdates::default(), "skip")
+            .await
+            .expect_err("a backend that doesn't override this must reject it, not silently succeed");
+        assert!(err.contains("not supported"), "error should say the operation isn't supported: {err}");
+    }
+
+    #[tokio::test]
+    async fn default_list_contacts_needing_enrichment_returns_an_empty_list() {
+        let backend = MinimalBackend;
+        let contacts = backend
+            .list_contacts_needing_enrichment(50)
+            .await
+            .expect("the default must be Ok(empty), not an error — this one has no error path");
+        assert!(contacts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn server_over_a_non_overriding_backend_still_answers_both_new_contact_tools() {
+        let server = McpServer::new(MinimalBackend, "test-server", "test instructions");
+
+        let update_result = server
+            .update_contact_fields(Parameters(UpdateContactFieldsParams {
+                contact_id: 1,
+                fields: ContactFieldUpdates::default(),
+                write_mode: None,
+            }))
+            .await;
+        assert!(update_result.is_err(), "tool call should surface the backend's not-supported error");
+
+        let list_result = server
+            .list_contacts_needing_enrichment(Parameters(ListContactsNeedingEnrichmentParams { limit: None }))
+            .await
+            .expect("list tool should succeed with an empty list, not error");
+        let ContentBlock::Text(text) = &list_result.content[0] else {
+            panic!("expected a text content block, got {:?}", list_result.content[0]);
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&text.text).unwrap();
+        assert_eq!(parsed, serde_json::json!({ "contacts": [] }));
     }
 
     #[tokio::test]
@@ -573,6 +886,24 @@ mod tests {
             .await
             .expect_err("a backend that doesn't override this must reject it, not silently succeed");
         assert!(err.contains("not supported"), "error should say the operation isn't supported: {err}");
+    }
+
+    #[tokio::test]
+    async fn default_backup_vault_returns_a_clear_not_supported_error() {
+        let backend = MinimalBackend;
+        let err = backend
+            .backup_vault("/tmp/whatever.db")
+            .await
+            .expect_err("a backend that doesn't override this must reject it, not silently succeed");
+        assert!(err.contains("not supported"), "error should say the operation isn't supported: {err}");
+    }
+
+    #[tokio::test]
+    async fn server_over_a_non_overriding_backend_still_rejects_backup_vault() {
+        let server = McpServer::new(MinimalBackend, "test-server", "test instructions");
+        let result =
+            server.backup_vault(Parameters(BackupVaultParams { path: "/tmp/whatever.db".to_string() })).await;
+        assert!(result.is_err(), "tool call should surface the backend's not-supported error");
     }
 
     #[tokio::test]
