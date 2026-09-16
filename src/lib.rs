@@ -3,7 +3,7 @@
 //! shaped roughly like one.
 //!
 //! This crate has zero knowledge of any particular app's schema or storage.
-//! It defines [`McpBackend`], a trait describing the eight operations a
+//! It defines [`McpBackend`], a trait describing the operations a
 //! contacts-style data source needs to support, and [`McpServer`], a generic
 //! MCP server that exposes those operations as MCP tools over any transport
 //! `rmcp` supports (stdio, HTTP/SSE, …). Bring your own backend by
@@ -25,7 +25,7 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 
-/// The eight operations a contacts/company-style backend must implement to
+/// The operations a contacts/company-style backend must implement to
 /// be exposed as MCP tools. Every method takes `&self` (implementers own
 /// their own interior mutability/locking, e.g. an `Arc<Mutex<Connection>>`)
 /// and returns `Result<_, Self::Error>` — errors are surfaced to the calling
@@ -75,6 +75,21 @@ pub trait McpBackend: Send + Sync + 'static {
         limit: i64,
         offset: i64,
     ) -> Result<(i64, Vec<Self::Contact>), Self::Error>;
+
+    /// Look up a contact by exact email address (case-insensitive is
+    /// recommended, not required). `None` (not an error) when nothing
+    /// matches. A separate operation from `search_contacts` on purpose: its
+    /// free-text query is tokenized per whitespace-separated word, which a
+    /// punctuated string like an email address defeats, so it can't be
+    /// relied on to find someone by address alone. Useful for identifying
+    /// who a captured inbound message (see
+    /// [`add_contact_interaction`](McpBackend::add_contact_interaction))
+    /// actually came from.
+    /// Default implementation returns `Self::Error`; override to support
+    /// this operation.
+    async fn find_contact_by_email(&self, _email: &str) -> Result<Option<Self::Contact>, Self::Error> {
+        Err("find_contact_by_email is not supported by this backend".into())
+    }
 
     /// Aggregate counts (however the backend defines "a contact" / "a
     /// company") — cheaper and unambiguous compared to paging through
@@ -284,6 +299,18 @@ struct SearchContactsParams {
 struct SearchContactsResult<C> {
     total_matches: i64,
     results: Vec<C>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct FindContactByEmailParams {
+    /// Exact email address to look up.
+    email: String,
+}
+
+#[derive(Debug, Serialize)]
+struct FindContactByEmailResult<C> {
+    found: bool,
+    contact: Option<C>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -599,6 +626,22 @@ impl<B: McpBackend> McpServer<B> {
         let (total, results) =
             self.backend.search_contacts(&p.query, status, limit, offset).await.map_err(backend_err)?;
         json_result(&SearchContactsResult { total_matches: total, results })
+    }
+
+    #[tool(
+        description = "Look up a contact by their exact email address. Prefer this over \
+                        search_contacts when you're identifying someone from an address alone \
+                        (e.g. who an inbound email came from). search_contacts's free-text \
+                        matching is tokenized per word and isn't reliable for a punctuated string \
+                        like an email address. `found: false` (not an error) when no contact has \
+                        that address."
+    )]
+    async fn find_contact_by_email(
+        &self,
+        Parameters(p): Parameters<FindContactByEmailParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let contact = self.backend.find_contact_by_email(&p.email).await.map_err(backend_err)?;
+        json_result(&FindContactByEmailResult { found: contact.is_some(), contact })
     }
 
     #[tool(
