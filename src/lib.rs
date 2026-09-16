@@ -53,6 +53,12 @@ pub trait McpBackend: Send + Sync + 'static {
     type Contact: Serialize + Send + Sync;
     type Company: Serialize + Send + Sync;
     type Stats: Serialize + Send + Sync;
+    /// Whatever a backend returns from [`add_contact_interaction`](
+    /// McpBackend::add_contact_interaction): a logged note, sent email, or
+    /// reply. Required unconditionally (same as `Contact`/`Company`/`Stats`
+    /// above) even though the operation itself is optional; a backend that
+    /// doesn't support it can use `()` or any placeholder type here.
+    type Interaction: Serialize + Send + Sync;
     type Error: std::fmt::Display + Send + Sync + From<&'static str>;
 
     /// Free-text search across whatever fields the backend considers
@@ -186,6 +192,35 @@ pub trait McpBackend: Send + Sync + 'static {
     /// want to expose this over MCP, simply doesn't implement it.
     async fn backup_vault(&self, _path: &str) -> Result<(), Self::Error> {
         Err("backup_vault is not supported by this backend".into())
+    }
+
+    /// Log an interaction against a contact: a plain manual note by default
+    /// (`kind` omitted, or `"note"`), or, for a backend that supports it, a
+    /// record of a real email the caller just sent (`kind = "email_sent"`)
+    /// or an inbound reply it captured (`kind = "email_reply"`).
+    /// `subject`/`from_address`/`to_address`/`recipient_role`/`deal_id` only
+    /// apply to an email-kind row (a backend with no concept of one of
+    /// these, e.g. no deals, is free to ignore it). `note` always carries
+    /// the interaction's body text; whether an email-kind row's full body is
+    /// actually retained (vs. just its metadata) is entirely backend-defined,
+    /// and a backend may silently substitute a placeholder per its own
+    /// settings rather than storing what was passed here.
+    /// Default implementation returns `Self::Error`; override to support
+    /// this operation. A backend with no interaction-log concept simply
+    /// doesn't implement it.
+    #[allow(clippy::too_many_arguments)]
+    async fn add_contact_interaction(
+        &self,
+        _contact_id: i64,
+        _note: &str,
+        _kind: Option<&str>,
+        _subject: Option<&str>,
+        _from_address: Option<&str>,
+        _to_address: Option<&str>,
+        _recipient_role: Option<&str>,
+        _deal_id: Option<i64>,
+    ) -> Result<Self::Interaction, Self::Error> {
+        Err("add_contact_interaction is not supported by this backend".into())
     }
 }
 
@@ -486,6 +521,42 @@ struct BackupVaultParams {
     path: String,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct AddContactInteractionParams {
+    /// The contact this interaction is logged against. Use search_contacts
+    /// first if you're not certain of the id.
+    contact_id: i64,
+    /// The interaction's body text. For an email-kind row, this is the full
+    /// message; pass the real content regardless of whether the backend
+    /// ends up retaining it (that's governed by the backend's own settings,
+    /// not by this call).
+    note: String,
+    /// "note" (a plain manual note, the default if omitted), "email_sent"
+    /// (a real email you just sent), or "email_reply" (an inbound reply you
+    /// captured). A backend may reject a kind it doesn't support.
+    #[serde(default)]
+    kind: Option<String>,
+    /// The email's subject line. Only meaningful for an email-kind row.
+    #[serde(default)]
+    subject: Option<String>,
+    /// The sender's address. Only meaningful for "email_reply" (the
+    /// address the reply came from).
+    #[serde(default)]
+    from_address: Option<String>,
+    /// The recipient's address. Only meaningful for "email_sent".
+    #[serde(default)]
+    to_address: Option<String>,
+    /// "to", "cc", or "bcc". Only meaningful for "email_sent" (a reply has
+    /// exactly one sender, nothing to distinguish).
+    #[serde(default)]
+    recipient_role: Option<String>,
+    /// Id of a deal this interaction is about, for a backend that links
+    /// interactions to deals. Omit if there's no deal, or the backend has no
+    /// such concept. Accepts a number or a numeric string.
+    #[serde(default, deserialize_with = "deserialize_flexible_i64")]
+    deal_id: Option<i64>,
+}
+
 /// The generic MCP server. Wraps any [`McpBackend`] implementation and
 /// exposes its six operations as MCP tools. Construct one with
 /// [`McpServer::new`], then hand it to whichever `rmcp` transport you want
@@ -711,6 +782,38 @@ impl<B: McpBackend> McpServer<B> {
     ) -> Result<CallToolResult, ErrorData> {
         self.backend.backup_vault(&p.path).await.map_err(backend_err)?;
         json_result(&serde_json::json!({ "backed_up_to": p.path }))
+    }
+
+    #[tool(
+        description = "Log an interaction against a contact: a plain note (kind omitted or \
+                        \"note\"), a real email you just sent (kind = \"email_sent\", with \
+                        subject/to_address/recipient_role; call this once per recipient), or an \
+                        inbound reply you captured (kind = \"email_reply\", with \
+                        subject/from_address). Pass the full body in `note` either way. Whether \
+                        it's actually retained (vs. just metadata) is governed entirely by the \
+                        backend's own settings, not by this call. deal_id links it to a deal, if \
+                        you know one and the backend supports it. Use search_contacts first if \
+                        you're not certain of the contact_id."
+    )]
+    async fn add_contact_interaction(
+        &self,
+        Parameters(p): Parameters<AddContactInteractionParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let interaction = self
+            .backend
+            .add_contact_interaction(
+                p.contact_id,
+                &p.note,
+                p.kind.as_deref(),
+                p.subject.as_deref(),
+                p.from_address.as_deref(),
+                p.to_address.as_deref(),
+                p.recipient_role.as_deref(),
+                p.deal_id,
+            )
+            .await
+            .map_err(backend_err)?;
+        json_result(&interaction)
     }
 }
 
