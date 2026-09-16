@@ -223,6 +223,17 @@ pub trait McpBackend: Send + Sync + 'static {
     /// Default implementation returns `Self::Error`; override to support
     /// this operation. A backend with no interaction-log concept simply
     /// doesn't implement it.
+    ///
+    /// `message_id`/`in_reply_to` are RFC 5322 threading headers, trailing
+    /// params added after this method first shipped (so an existing
+    /// override recompiles once it adds the two new parameters, same
+    /// contract as every other addition to this trait). `message_id` is
+    /// THIS message's own `Message-ID` — meaningful on both "email_sent"
+    /// (the outbound message you just sent) and "email_reply" (the inbound
+    /// message you captured). `in_reply_to` is the PARENT message's
+    /// `Message-ID` — meaningful only on "email_reply". A backend with no
+    /// concept of either is free to ignore them, same as any other optional
+    /// param here.
     #[allow(clippy::too_many_arguments)]
     async fn add_contact_interaction(
         &self,
@@ -234,6 +245,8 @@ pub trait McpBackend: Send + Sync + 'static {
         _to_address: Option<&str>,
         _recipient_role: Option<&str>,
         _deal_id: Option<i64>,
+        _message_id: Option<&str>,
+        _in_reply_to: Option<&str>,
     ) -> Result<Self::Interaction, Self::Error> {
         Err("add_contact_interaction is not supported by this backend".into())
     }
@@ -582,6 +595,20 @@ struct AddContactInteractionParams {
     /// such concept. Accepts a number or a numeric string.
     #[serde(default, deserialize_with = "deserialize_flexible_i64")]
     deal_id: Option<i64>,
+    /// This message's own `Message-ID` header, exactly as it appears on the
+    /// wire (e.g. "<CAB1234@mail.gmail.com>"). For "email_sent", this is the
+    /// outbound message you just sent — report it if your mail client/API
+    /// exposes it, since it's the only way this record can later be matched
+    /// to a specific reply rather than guessed at by recipient + timestamp.
+    /// For "email_reply", this is the inbound message's own id.
+    #[serde(default)]
+    message_id: Option<String>,
+    /// Only meaningful for "email_reply": the PARENT message's
+    /// `Message-ID`, taken from this reply's own `In-Reply-To` (or
+    /// `References`) header. Report it whenever you have it — it's what
+    /// lets this reply be linked to the exact send that caused it.
+    #[serde(default)]
+    in_reply_to: Option<String>,
 }
 
 /// The generic MCP server. Wraps any [`McpBackend`] implementation and
@@ -835,8 +862,13 @@ impl<B: McpBackend> McpServer<B> {
                         subject/from_address). Pass the full body in `note` either way. Whether \
                         it's actually retained (vs. just metadata) is governed entirely by the \
                         backend's own settings, not by this call. deal_id links it to a deal, if \
-                        you know one and the backend supports it. Use search_contacts first if \
-                        you're not certain of the contact_id."
+                        you know one and the backend supports it. ALWAYS report message_id when \
+                        you can: on \"email_sent\" it's the outbound message's own Message-ID, \
+                        and on \"email_reply\" it's the inbound message's own Message-ID plus \
+                        in_reply_to (its In-Reply-To/References header) — this is the only way a \
+                        reply can later be matched to the exact send that caused it, rather than \
+                        guessed at by recipient and timestamp. Use search_contacts first if you're \
+                        not certain of the contact_id."
     )]
     async fn add_contact_interaction(
         &self,
@@ -853,6 +885,8 @@ impl<B: McpBackend> McpServer<B> {
                 p.to_address.as_deref(),
                 p.recipient_role.as_deref(),
                 p.deal_id,
+                p.message_id.as_deref(),
+                p.in_reply_to.as_deref(),
             )
             .await
             .map_err(backend_err)?;
